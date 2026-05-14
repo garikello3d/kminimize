@@ -1,0 +1,16 @@
+[package]
+name = "ktinify"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ktinify"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = "1"
+gcov = { path = "../../crates/gcov" }
+kbuild = { path = "../../crates/kbuild" }
+kconfig = { path = "../../crates/kconfig" }
+gather = { path = "../../crates/gather" }

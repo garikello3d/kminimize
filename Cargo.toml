@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "bin/ktinify",
+    "bin/ktinify-gather",
+    "crates/gcov",
+    "crates/kbuild",
+    "crates/kconfig",
+    "crates/gather",
+]
+resolver = "2"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
