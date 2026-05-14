@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "bin/ktinify",
-    "bin/ktinify-gather",
+    "bin/kminimize",
+    "bin/kgather",
     "crates/gcov",
     "crates/kbuild",
     "crates/kconfig",

@@ -1,5 +1,5 @@
 [package]
-name = "ktinify-gather"
+name = "kgather"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,7 +9,7 @@ edition = "2021"
 # Install the musl toolchain with: rustup target add x86_64-unknown-linux-musl
 
 [[bin]]
-name = "ktinify-gather"
+name = "kgather"
 path = "src/main.rs"
 
 [dependencies]

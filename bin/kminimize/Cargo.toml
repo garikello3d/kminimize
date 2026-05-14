@@ -1,10 +1,10 @@
 [package]
-name = "ktinify"
+name = "kminimize"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "ktinify"
+name = "kminimize"
 path = "src/main.rs"
 
 [dependencies]

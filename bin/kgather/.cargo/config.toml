@@ -1,0 +1,6 @@
+# Force static CRT linking for all musl targets regardless of architecture.
+# Build with: cargo build --release --target <arch>-unknown-linux-musl
+# e.g.:  cargo build --release --target x86_64-unknown-linux-musl
+#        cargo build --release --target aarch64-unknown-linux-musl
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=+crt-static"]
