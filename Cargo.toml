@@ -15,3 +15,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
+# Path dep while qoc has no GitHub commits yet.
+# Once you push qoc's first commit, replace the line below with:
+#   qoc = { git = "https://github.com/garikello3d/qoc" }
+# and add this section to override it locally during development:
+#   [patch."https://github.com/garikello3d/qoc"]
+#   qoc = { path = "../qoc" }
+qoc = { path = "../qoc" }

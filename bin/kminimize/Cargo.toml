@@ -14,3 +14,6 @@ gcov = { path = "../../crates/gcov" }
 kbuild = { path = "../../crates/kbuild" }
 kconfig = { path = "../../crates/kconfig" }
 gather = { path = "../../crates/gather" }
+
+[dev-dependencies]
+qoc = { workspace = true }

@@ -55,7 +55,8 @@ fn gather_loop(output: PathBuf, interval_secs: u64) -> gather::Result<()> {
     eprintln!("kgather: sampling every {interval_secs}s, press Ctrl-C to stop");
 
     loop {
-        let snap = gather::snapshot()?;
+        let content = std::fs::read_to_string("/proc/modules")?;
+        let snap = gather::snapshot_from_content(&content)?;
         eprintln!(
             "kgather: snapshot at {} — {} modules",
             snap.timestamp_secs,

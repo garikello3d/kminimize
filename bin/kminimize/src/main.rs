@@ -18,6 +18,8 @@ enum Commands {
     Disable(DisableArgs),
     /// Report every way to disable a named module from the build, ranked by collateral damage.
     ModulePlan(ModulePlanArgs),
+    /// Gather /proc/modules snapshots from a remote system over SSH, then report peak usage.
+    RemoteGather(RemoteGatherArgs),
 }
 
 #[derive(clap::Args)]
@@ -72,11 +74,31 @@ struct ModulePlanArgs {
     cc: Option<String>,
 }
 
+#[derive(clap::Args)]
+struct RemoteGatherArgs {
+    /// SSH target as user@hostname.
+    #[arg(long)]
+    ssh_url: String,
+
+    /// SSH port.
+    #[arg(long, default_value = "22")]
+    port: u16,
+
+    /// Seconds between /proc/modules samples.
+    #[arg(long)]
+    interval: u64,
+
+    /// Total observation duration in seconds.
+    #[arg(long)]
+    duration: u64,
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Disable(args) => disable(args),
         Commands::ModulePlan(args) => module_plan(args),
+        Commands::RemoteGather(args) => remote_gather(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -808,4 +830,144 @@ fn run_git(args: &[&str]) -> anyhow::Result<()> {
         anyhow::bail!("git {} exited with {}", args.join(" "), status);
     }
     Ok(())
+}
+
+fn remote_gather(args: RemoteGatherArgs) -> anyhow::Result<()> {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let duration = Duration::from_secs(args.duration);
+    let interval = Duration::from_secs(args.interval);
+    let start = Instant::now();
+
+    let mut snapshots: Vec<gather::ModuleSnapshot> = Vec::new();
+
+    eprintln!(
+        "remote-gather: {}:{} — interval {}s, duration {}s",
+        args.ssh_url, args.port, args.interval, args.duration,
+    );
+
+    loop {
+        let output = std::process::Command::new("ssh")
+            .arg("-p")
+            .arg(args.port.to_string())
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg(&args.ssh_url)
+            .arg("cat /proc/modules")
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("ssh exited with {}: {}", output.status, stderr.trim());
+        }
+
+        let content = String::from_utf8(output.stdout)
+            .map_err(|_| anyhow::anyhow!("ssh output is not valid UTF-8"))?;
+
+        let snap = gather::snapshot_from_content(&content)
+            .map_err(|e| anyhow::anyhow!("failed to parse /proc/modules: {e}"))?;
+
+        eprintln!(
+            "remote-gather: snapshot at {} — {} modules",
+            snap.timestamp_secs,
+            snap.modules.len(),
+        );
+        snapshots.push(snap);
+
+        let elapsed = start.elapsed();
+        if elapsed >= duration {
+            break;
+        }
+        let remaining = duration - elapsed;
+        thread::sleep(remaining.min(interval));
+    }
+
+    if snapshots.is_empty() {
+        anyhow::bail!("no snapshots collected");
+    }
+
+    // Find the snapshot with the largest total use_count across Live modules
+    // (highest combined reference count = peak usage exposure).
+    let best = snapshots
+        .iter()
+        .max_by_key(|s| {
+            s.modules
+                .iter()
+                .filter(|m| m.state == gather::ModuleState::Live)
+                .map(|m| m.use_count as u64)
+                .sum::<u64>()
+        })
+        .unwrap();
+
+    println!();
+    println!("Peak-usage snapshot (highest total use_count across {} snapshots):", snapshots.len());
+    print_snapshot(best);
+
+    Ok(())
+}
+
+fn print_snapshot(snap: &gather::ModuleSnapshot) {
+    let active_count = snap
+        .modules
+        .iter()
+        .filter(|m| m.state == gather::ModuleState::Live && m.use_count > 0)
+        .count();
+    let total_use: u64 = snap
+        .modules
+        .iter()
+        .filter(|m| m.state == gather::ModuleState::Live)
+        .map(|m| m.use_count as u64)
+        .sum();
+
+    println!(
+        "  timestamp : {} (Unix seconds)",
+        snap.timestamp_secs
+    );
+    println!(
+        "  modules   : {} loaded, {} active (use_count > 0), total use_count = {}",
+        snap.modules.len(),
+        active_count,
+        total_use,
+    );
+    println!();
+
+    let mut live: Vec<&gather::ModuleEntry> = snap
+        .modules
+        .iter()
+        .filter(|m| m.state == gather::ModuleState::Live)
+        .collect();
+    live.sort_by(|a, b| b.use_count.cmp(&a.use_count).then(a.name.cmp(&b.name)));
+
+    println!("{:<36} {:>9}  {}", "module", "use_count", "used_by");
+    println!("{}", "-".repeat(72));
+    for m in &live {
+        let used_by = if m.used_by.is_empty() {
+            "-".to_owned()
+        } else {
+            m.used_by.join(", ")
+        };
+        let oot = if m.is_out_of_tree { "  (out-of-tree)" } else { "" };
+        println!("{:<36} {:>9}  {}{}", m.name, m.use_count, used_by, oot);
+    }
+
+    let transitional: Vec<&gather::ModuleEntry> = snap
+        .modules
+        .iter()
+        .filter(|m| m.state != gather::ModuleState::Live)
+        .collect();
+    if !transitional.is_empty() {
+        println!();
+        println!("  Transitional modules ({}):", transitional.len());
+        for m in &transitional {
+            println!("    {:?}  {}", m.state, m.name);
+        }
+    }
 }

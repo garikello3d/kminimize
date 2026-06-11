@@ -512,16 +512,24 @@ pub fn parse_proc_modules(content: &str) -> Result<Vec<ModuleEntry>> {
     Ok(entries)
 }
 
-/// Reads the current loaded-module state from `/proc/modules` and returns
-/// a timestamped snapshot.
-pub fn snapshot() -> Result<ModuleSnapshot> {
-    let content = std::fs::read_to_string("/proc/modules").map_err(Error::Io)?;
-    let modules = parse_proc_modules(&content)?;
+/// Parses `content` (the text of `/proc/modules`) into a timestamped snapshot.
+///
+/// Use this when the content was obtained by some means other than a local
+/// filesystem read — for example, fetched over SSH.
+pub fn snapshot_from_content(content: &str) -> Result<ModuleSnapshot> {
+    let modules = parse_proc_modules(content)?;
     let timestamp_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     Ok(ModuleSnapshot { timestamp_secs, modules })
+}
+
+/// Reads the current loaded-module state from `/proc/modules` and returns
+/// a timestamped snapshot.
+pub fn snapshot() -> Result<ModuleSnapshot> {
+    let content = std::fs::read_to_string("/proc/modules").map_err(Error::Io)?;
+    snapshot_from_content(&content)
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
