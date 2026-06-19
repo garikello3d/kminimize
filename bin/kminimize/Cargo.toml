@@ -3,6 +3,10 @@ name = "kminimize"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kminimize"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kminimize"
 path = "src/main.rs"

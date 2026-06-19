@@ -14,6 +14,20 @@ impl Drop for TempDir {
     }
 }
 
+/// Runs `argv[0]` with `argv[1..]` in `dir`, returning an error if the
+/// process cannot be spawned or exits with a non-zero status.
+fn run_cmd(dir: &Path, argv: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new(argv[0])
+        .args(&argv[1..])
+        .current_dir(dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn '{}': {e}", argv[0]))?;
+    if !status.success() {
+        anyhow::bail!("'{}' failed with {}", argv.join(" "), status);
+    }
+    Ok(())
+}
+
 /// Queries the remote for all tags and returns the one that matches
 /// `v{upstream_version}` exactly, or the first tag that starts with that
 /// prefix (covers release-candidate suffixes).
@@ -63,7 +77,7 @@ fn upstream_version_to_git_tag(kernel_src: &Path, upstream_version: &str) -> any
 //   TEST_KERNEL_SRC=/path/to/linux \
 //     cargo test -p kminimize vm_module_stats_integration -- --ignored --nocapture
 #[test]
-#[ignore = "requires VM infrastructure (QEMU, virtiofsd, proot); set TEST_KERNEL_SRC and run with --ignored"]
+#[ignore = "requires VM infrastructure (QEMU, virtiofsd, proot) and a kernel build toolchain; set TEST_KERNEL_SRC and run with --ignored"]
 fn vm_module_stats_integration() {
     let kernel_src_str = env::var("TEST_KERNEL_SRC").unwrap_or_else(|_| {
         panic!(
@@ -106,11 +120,13 @@ fn vm_module_stats_integration() {
     let upstream_version = info
         .upstream_version
         .expect("VmInfo::upstream_version is None");
-    let config_len = info.kernel_config.as_deref().unwrap_or("").len();
+    let kernel_config_body = info
+        .kernel_config
+        .expect("VmInfo::kernel_config is None — kernel must be built with CONFIG_IKCONFIG_PROC or have /boot/config-*");
 
     println!("kernel_version:   {kernel_version}");
     println!("upstream_version: {upstream_version}");
-    println!("kernel_config:    {config_len} bytes");
+    println!("kernel_config:    {} bytes", kernel_config_body.len());
 
     // Step 4: gather /proc/modules snapshots every second for 10 seconds.
     let mut module_list = gather::ModuleList::new();
@@ -126,11 +142,7 @@ fn vm_module_stats_integration() {
         let snapshot = gather::snapshot_from_content(&ssh_out.stdout)
             .unwrap_or_else(|e| panic!("failed to parse /proc/modules on iteration {i}: {e}"));
 
-        println!(
-            "snapshot {}: {} modules",
-            i + 1,
-            snapshot.modules.len()
-        );
+        println!("snapshot {}: {} modules", i + 1, snapshot.modules.len());
         module_list.snapshots.push(snapshot);
 
         if i < 9 {
@@ -143,10 +155,85 @@ fn vm_module_stats_integration() {
         .expect("failed to find upstream git tag");
     println!("upstream git tag: {git_tag}");
 
-    // Step 6: terminate the VM gracefully.
+    // Step 6: VM is no longer needed — terminate it before the build work.
     println!("Stopping VM...");
     handle.stop().expect("VM stop failed");
 
+    // Step 7: check out the exact upstream tag and clean the source tree.
+    println!("Checking out {git_tag}...");
+    run_cmd(&kernel_src, &["git", "checkout", &git_tag])
+        .expect("git checkout failed");
+    run_cmd(&kernel_src, &["git", "clean", "-fddx"])
+        .expect("git clean failed");
+
+    // Step 8: place the VM's kernel config as .config.
+    let dot_config = kernel_src.join(".config");
+    fs::write(&dot_config, &kernel_config_body).expect("failed to write .config");
+    println!(".config written ({} bytes)", kernel_config_body.len());
+
+    // Step 9: normalise the config for the checked-out source version.
+    println!("Running make olddefconfig (initial)...");
+    run_cmd(&kernel_src, &["make", "olddefconfig"])
+        .expect("make olddefconfig (initial) failed");
+
+    // Step 9.5: apply known changes, each with a list of candidate commits.
+    // For each change the first successfully cherry-picked commit wins; the
+    // rest of the candidates for that change are skipped.  All changes are
+    // attempted regardless of whether any individual one succeeded.
+    const PATCHES: &[(&str, &[&str])] = &[
+        (
+            "libbpf: Fix -Wdiscarded-qualifiers under C23",
+            &[
+                "d70f79fef65810faf64dbae1f3a1b5623cdb2345",
+                "ab21cf885fb2af179c44d8beeabd716133b9385d",
+                "3dedeeecd1ae42a751721d83dc21877122cc1795",
+                "bb42e9627aa92a0d6482a599cbea58708f1c3c63",
+            ],
+        ),
+        (
+            "KVM: VMX: Make vmread_error_trampoline() uncallable from C code",
+            &["50bdbfa5d2fb29d548435de8ece57788d01e201f"],
+        ),
+    ];
+    println!("Applying patch commits...");
+    for (change, hashes) in PATCHES {
+        println!("  Change: {change}");
+        let mut applied = false;
+        for hash in *hashes {
+            let status = Command::new("git")
+                .args(["cherry-pick", hash])
+                .current_dir(&kernel_src)
+                .status()
+                .expect("failed to spawn git cherry-pick");
+            if status.success() {
+                println!("    Applied {hash}.");
+                applied = true;
+                break;
+            }
+            run_cmd(&kernel_src, &["git", "cherry-pick", "--abort"])
+                .expect("git cherry-pick --abort failed");
+        }
+        if !applied {
+            println!("    No candidate commit could be applied.");
+        }
+    }
+
+    // Step 10: apply config reduction using the existing disable logic.
+    println!("Reducing config...");
+    kminimize::reduce_config(&kernel_src, &module_list, &dot_config)
+        .expect("reduce_config failed");
+
+    // Step 11: normalise again after reduction so cascades are resolved.
+    println!("Running make olddefconfig (post-reduction)...");
+    run_cmd(&kernel_src, &["make", "olddefconfig"])
+        .expect("make olddefconfig (post-reduction) failed");
+
+    // Step 12: build the kernel.
+    println!("Building kernel (make -j24)...");
+    run_cmd(&kernel_src, &["make", "-j24"])
+        .expect("kernel build failed");
+
+    println!("All steps completed successfully.");
     assert_eq!(module_list.snapshots.len(), 10);
     assert!(!git_tag.is_empty());
 }
