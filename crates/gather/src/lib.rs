@@ -525,6 +525,31 @@ pub fn snapshot_from_content(content: &str) -> Result<ModuleSnapshot> {
     Ok(ModuleSnapshot { timestamp_secs, modules })
 }
 
+/// Parse newline-separated modalias strings into a sorted, deduplicated list.
+/// Works for both sysfs-collected aliases (concatenated local reads) and SSH output.
+pub fn parse_device_aliases(raw: &str) -> Vec<String> {
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for alias in raw.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        set.insert(alias.to_owned());
+    }
+    let mut v: Vec<String> = set.into_iter().collect();
+    v.sort_unstable();
+    v
+}
+
+/// Parse the content of a `modules.alias` file into (pattern, module_name) pairs.
+/// Lines not starting with "alias" (comments, blank lines) are skipped.
+pub fn parse_modules_alias(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("alias ")?;
+            let (pattern, module) = rest.split_once(' ')?;
+            Some((pattern.trim().to_owned(), module.trim().to_owned()))
+        })
+        .collect()
+}
+
 /// Reads the current loaded-module state from `/proc/modules` and returns
 /// a timestamped snapshot.
 pub fn snapshot() -> Result<ModuleSnapshot> {
@@ -661,6 +686,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
     fn ever_used_includes_nonzero_use_count() {
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry("foo", 1, false)])],
+            ..Default::default()
         };
         assert!(list.ever_used().contains("foo"));
     }
@@ -669,6 +695,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
     fn ever_used_excludes_zero_use_count() {
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry("foo", 0, false)])],
+            ..Default::default()
         };
         assert!(!list.ever_used().contains("foo"));
     }
@@ -677,6 +704,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
     fn ever_used_excludes_out_of_tree() {
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry("vboxdrv", 2, true)])],
+            ..Default::default()
         };
         assert!(!list.ever_used().contains("vboxdrv"));
     }
@@ -691,6 +719,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_state("unloading_mod", 1, ModuleState::Unloading),
                 ],
             )],
+            ..Default::default()
         };
         assert!(!list.ever_used().contains("loading_mod"));
         assert!(!list.ever_used().contains("unloading_mod"));
@@ -704,6 +733,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                 snap(1, vec![make_entry("foo", 0, false)]),
                 snap(2, vec![make_entry("foo", 3, false)]),
             ],
+            ..Default::default()
         };
         assert!(list.ever_used().contains("foo"));
     }
@@ -714,6 +744,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
     fn never_used_excludes_ever_used_module() {
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry("foo", 1, false)])],
+            ..Default::default()
         };
         assert!(!list.never_used().contains("foo"));
     }
@@ -725,6 +756,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                 snap(1, vec![make_entry("idle", 0, false)]),
                 snap(2, vec![make_entry("idle", 0, false)]),
             ],
+            ..Default::default()
         };
         assert!(list.never_used().contains("idle"));
     }
@@ -733,6 +765,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
     fn never_used_excludes_out_of_tree() {
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry("zenpower", 0, true)])],
+            ..Default::default()
         };
         assert!(!list.never_used().contains("zenpower"));
     }
@@ -763,6 +796,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_deps("unrelated", vec![]),
                 ],
             )],
+            ..Default::default()
         };
         let cascade = list.disable_cascade("ib_core");
         assert!(cascade.contains("rdma_cm"));
@@ -783,6 +817,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_deps("c", vec!["b"]),
                 ],
             )],
+            ..Default::default()
         };
         let cascade = list.disable_cascade("a");
         assert!(cascade.contains("b"));
@@ -793,6 +828,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
     fn disable_cascade_no_dependents() {
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry_deps("leaf", vec![])])],
+            ..Default::default()
         };
         assert!(list.disable_cascade("leaf").is_empty());
     }
@@ -803,6 +839,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
         oot.is_out_of_tree = true;
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry_deps("ib_core", vec![]), oot])],
+            ..Default::default()
         };
         // oot_mod depends on ib_core, but it's out-of-tree — should not appear in cascade.
         assert!(!list.disable_cascade("ib_core").contains("oot_mod"));
@@ -822,6 +859,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     ],
                 ),
             ],
+            ..Default::default()
         };
         assert!(list.disable_cascade("base").contains("late_dep"));
     }
@@ -841,6 +879,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_deps("rpcrdma", vec![]),
                 ],
             )],
+            ..Default::default()
         };
         let map = list.ever_depended_on_by();
         // ib_core is depended on by rpcrdma and rdma_cm
@@ -966,6 +1005,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
         // "active" has use_count=1, used_by=[] → directly active.
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry_uc("active", 1, vec![])])],
+            ..Default::default()
         };
         let clusters = list.safely_disableable_clusters();
         let all: Vec<&str> = clusters.iter().flat_map(|c| c.iter().map(String::as_str)).collect();
@@ -984,6 +1024,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_uc("dep", 1, vec![]),         // dep has use_count=1 from active loading it
                 ],
             )],
+            ..Default::default()
         };
         // active: use_count=2, used_by=["dep"] → direct = 2-1 = 1 > 0 → directly active
         // dep: use_count=1, used_by=[] → not directly active, but required by active → must keep
@@ -998,6 +1039,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
         // Module with use_count=0, no deps, not depended on → isolated cluster.
         let list = ModuleList {
             snapshots: vec![snap(1, vec![make_entry_uc("idle", 0, vec![])])],
+            ..Default::default()
         };
         let clusters = list.safely_disableable_clusters();
         assert_eq!(clusters.len(), 1);
@@ -1026,6 +1068,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_uc("q", 0, vec![]),
                 ],
             )],
+            ..Default::default()
         };
         // active: use_count=2 > used_by=["x"].len()=1 → direct=1 → directly active
         // x: must-keep (needed by active)
@@ -1056,6 +1099,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
                     make_entry_uc("s", 0, vec![]),
                 ],
             )],
+            ..Default::default()
         };
         let clusters = list.safely_disableable_clusters();
         assert_eq!(clusters.len(), 2);
@@ -1077,6 +1121,7 @@ vboxdrv 696320 2 vboxnetadp,vboxnetflt, Live 0x0000000000000000 (OE)
 
         let original = ModuleList {
             snapshots: vec![snap(42, vec![make_entry("foo", 3, false)])],
+            ..Default::default()
         };
         original.save(&path).unwrap();
 

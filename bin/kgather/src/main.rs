@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -70,7 +69,6 @@ fn gather_loop(output: PathBuf, interval_secs: u64) -> gather::Result<()> {
 
 /// Walk `/sys/bus/*/devices/*/modalias` and return the unique set of alias strings.
 fn collect_device_aliases() -> Vec<String> {
-    let mut aliases: HashSet<String> = HashSet::new();
     let bus_dir = std::path::Path::new("/sys/bus");
     let bus_rd = match std::fs::read_dir(bus_dir) {
         Ok(rd) => rd,
@@ -79,55 +77,31 @@ fn collect_device_aliases() -> Vec<String> {
             return vec![];
         }
     };
+    let mut raw = String::new();
     for bus_entry in bus_rd.flatten() {
         let devices_dir = bus_entry.path().join("devices");
-        let dev_rd = match std::fs::read_dir(&devices_dir) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
+        let Ok(dev_rd) = std::fs::read_dir(&devices_dir) else { continue };
         for dev_entry in dev_rd.flatten() {
             let modalias_path = dev_entry.path().join("modalias");
             if let Ok(content) = std::fs::read_to_string(&modalias_path) {
-                let trimmed = content.trim().to_owned();
-                if !trimmed.is_empty() {
-                    aliases.insert(trimmed);
-                }
+                raw.push_str(content.trim());
+                raw.push('\n');
             }
         }
     }
-    let mut v: Vec<String> = aliases.into_iter().collect();
-    v.sort_unstable();
-    v
+    gather::parse_device_aliases(&raw)
 }
 
 /// Read `/lib/modules/<running-kernel>/modules.alias` and parse it into
 /// (pattern, module_name) pairs.
 fn read_modules_alias() -> Vec<(String, String)> {
-    let version = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .unwrap_or_default();
-    let version = version.trim();
-    let path = format!("/lib/modules/{version}/modules.alias");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
+    let version = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let path = format!("/lib/modules/{}/modules.alias", version.trim());
+    match std::fs::read_to_string(&path) {
+        Ok(content) => gather::parse_modules_alias(&content),
         Err(e) => {
             eprintln!("kgather: warning: cannot read {path}: {e}");
-            return vec![];
-        }
-    };
-    let mut result = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Format: "alias PATTERN MODULE_NAME"
-        let mut parts = line.splitn(3, ' ');
-        if parts.next() != Some("alias") {
-            continue;
-        }
-        if let (Some(pattern), Some(module)) = (parts.next(), parts.next()) {
-            result.push((pattern.to_owned(), module.to_owned()));
+            vec![]
         }
     }
-    result
 }
