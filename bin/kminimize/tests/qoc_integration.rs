@@ -213,10 +213,11 @@ fn vm_module_stats_integration() {
     }
 
     // Step 4b: collect device aliases and modules.alias — mirrors what kgather does locally.
-    // Use find -L so symlinks under /sys/bus/*/devices/* are followed correctly.
+    // Pass as a single SSH argument so the remote login shell expands the glob itself
+    // (passing ["sh", "-c", "cmd"] is wrong: SSH joins args with spaces, making sh -c
+    // receive only the first word as its command string).
     let alias_out = handle
-        .ssh(&["sh", "-c",
-               "find -L /sys/bus -maxdepth 4 -name modalias -exec cat {} + 2>/dev/null"])
+        .ssh(&["cat /sys/bus/*/devices/*/modalias 2>/dev/null"])
         .expect("failed to collect device aliases");
     module_list.device_aliases = gather::parse_device_aliases(&alias_out.stdout);
     println!("device aliases: {}", module_list.device_aliases.len());
