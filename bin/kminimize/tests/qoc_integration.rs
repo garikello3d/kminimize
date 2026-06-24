@@ -213,10 +213,10 @@ fn vm_module_stats_integration() {
     }
 
     // Step 4b: collect device aliases and modules.alias — mirrors what kgather does locally.
-    // Shell glob follows symlinks (unlike find without -L), which is required because
-    // /sys/bus/*/devices/* entries are symlinks to the real device directories.
+    // Use find -L so symlinks under /sys/bus/*/devices/* are followed correctly.
     let alias_out = handle
-        .ssh(&["sh", "-c", "cat /sys/bus/*/devices/*/modalias 2>/dev/null"])
+        .ssh(&["sh", "-c",
+               "find -L /sys/bus -maxdepth 4 -name modalias -exec cat {} + 2>/dev/null"])
         .expect("failed to collect device aliases");
     module_list.device_aliases = gather::parse_device_aliases(&alias_out.stdout);
     println!("device aliases: {}", module_list.device_aliases.len());
@@ -228,6 +228,12 @@ fn vm_module_stats_integration() {
     module_list.modules_alias = gather::parse_modules_alias(&mod_alias_out.stdout);
     println!("modules.alias entries: {}", module_list.modules_alias.len());
 
+    if env::var_os("KMINIMIZE_KEEP_TESTDIR").is_some() {
+        let gather_path = _cleanup.path.join("module_list.json");
+        module_list.save(&gather_path).expect("failed to save module_list");
+        println!("Gather data saved to {}", gather_path.display());
+    }
+
     // Step 5: find the canonical upstream git tag.
     let git_tag = upstream_version_to_git_tag(&kernel_src, &upstream_version)
         .expect("failed to find upstream git tag");
@@ -236,6 +242,13 @@ fn vm_module_stats_integration() {
     // Step 6: VM is no longer needed — terminate it before the build work.
     println!("Stopping VM...");
     handle.stop().expect("VM stop failed");
+
+    // Record kernel list as the baseline before the build.
+    let kernels_before_build = qoc::list_kernels(&rootfs_path).expect("list_kernels failed");
+    println!("Kernels before build ({}):", kernels_before_build.len());
+    for k in &kernels_before_build {
+        println!("  {k}");
+    }
 
     // Step 7: check out the exact upstream tag and clean the source tree.
     println!("Checking out {git_tag}...");
@@ -341,19 +354,36 @@ fn vm_module_stats_integration() {
         .expect("make_initrd failed");
     println!("initrd: {}", initrd_path.display());
 
-    // Step 17: list all kernel+initrd pairs now present in the rootfs.
+    // Step 17: list kernels and assert exactly one was added by the build.
     println!("Listing kernels in rootfs...");
     let kernels = qoc::list_kernels(&rootfs_path).expect("list_kernels failed");
     println!("Available kernels ({}):", kernels.len());
     for k in &kernels {
         println!("  {k}");
     }
-
-    println!("All steps completed successfully.");
-    assert_eq!(module_list.snapshots.len(), 10);
-    assert!(!git_tag.is_empty());
+    assert_eq!(
+        kernels.len(),
+        kernels_before_build.len() + 1,
+        "expected exactly one new kernel; before: {kernels_before_build:?}, after: {kernels:?}"
+    );
     assert!(
         kernels.iter().any(|k| k == &kernel_release),
         "newly built kernel '{kernel_release}' not found in list_kernels output"
     );
+
+    // Step 18: boot the VM with the reduced kernel; stream QEMU output to console.
+    println!("Booting reduced kernel {kernel_release} (show_log=true)...");
+    let (handle2, _) =
+        qoc::start(rootfs_path.clone(), 1, true, &kernel_release)
+            .expect("qoc::start (reduced kernel) failed");
+    let info2 = handle2.wait_for_info().expect("wait_for_info (reduced kernel) failed");
+    println!(
+        "Reduced kernel booted: version={:?} upstream={:?}",
+        info2.kernel_version, info2.upstream_version
+    );
+    handle2.stop().expect("VM stop (reduced kernel) failed");
+
+    println!("All steps completed successfully.");
+    assert_eq!(module_list.snapshots.len(), 10);
+    assert!(!git_tag.is_empty());
 }

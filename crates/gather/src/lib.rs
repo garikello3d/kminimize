@@ -329,8 +329,22 @@ impl ModuleList {
 
         // Also protect any module that handles a device physically present on
         // the target system (bus drivers, transport drivers, etc. that may have
-        // use_count=0 even when actively serving hardware).
-        must_keep.extend(self.device_required_modules());
+        // use_count=0 even when actively serving hardware).  Run BFS from the
+        // newly added modules so their own dependencies are protected too.
+        let mut dev_queue: VecDeque<String> = self
+            .device_required_modules()
+            .into_iter()
+            .filter(|m| must_keep.insert(m.clone()))
+            .collect();
+        while let Some(m) = dev_queue.pop_front() {
+            if let Some(deps) = deps_of.get(&m) {
+                for dep in deps {
+                    if must_keep.insert(dep.clone()) {
+                        dev_queue.push_back(dep.clone());
+                    }
+                }
+            }
+        }
 
         // Safely disableable = all Live in-tree modules not in must_keep.
         let disableable: HashSet<&str> = all_live
