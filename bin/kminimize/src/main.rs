@@ -1,3 +1,5 @@
+mod self_test;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,36 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum DistroKind {
+    Debian,
+    Arch,
+}
+
+impl DistroKind {
+    pub(crate) fn build(self) -> Box<dyn qoc::Distro> {
+        match self {
+            DistroKind::Debian => Box::new(qoc::Debian),
+            DistroKind::Arch => Box::new(qoc::Arch),
+        }
+    }
+}
+
+#[derive(clap::Args)]
+pub(crate) struct SelfTestArgs {
+    /// Path to the Linux kernel source tree to check out and build.
+    #[arg(long)]
+    linux_dir: PathBuf,
+
+    /// Distro to use for the VM rootfs.
+    #[arg(long, value_enum)]
+    distro: DistroKind,
+
+    /// Keep the temporary work directory after the test completes (default: delete on exit).
+    #[arg(long, default_value_t = false)]
+    keep_dir: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Produce a minimized .config by disabling kernel options unused during the observation period.
@@ -20,6 +52,8 @@ enum Commands {
     ModulePlan(ModulePlanArgs),
     /// Gather /proc/modules snapshots from a remote system over SSH, then report peak usage.
     RemoteGather(RemoteGatherArgs),
+    /// End-to-end self-test: boot a VM, gather modules, reduce config, rebuild, and re-boot.
+    SelfTest(SelfTestArgs),
 }
 
 #[derive(clap::Args)]
@@ -99,6 +133,7 @@ fn main() {
         Commands::Disable(args) => disable(args),
         Commands::ModulePlan(args) => module_plan(args),
         Commands::RemoteGather(args) => remote_gather(args),
+        Commands::SelfTest(args) => self_test::run(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

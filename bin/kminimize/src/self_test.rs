@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -6,8 +5,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-/// Removes a directory tree on drop unless `keep` is set.
-/// Set `KMINIMIZE_KEEP_TESTDIR=1` to suppress deletion for post-test analysis.
 struct TempDir {
     path: PathBuf,
     keep: bool,
@@ -16,15 +13,13 @@ struct TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         if self.keep {
-            println!("KMINIMIZE_KEEP_TESTDIR set — leaving test directory at {}", self.path.display());
+            println!("--keep-dir set — leaving test directory at {}", self.path.display());
         } else {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
 
-/// Runs `argv[0]` with `argv[1..]` in `dir`, returning an error if the
-/// process cannot be spawned or exits with a non-zero status.
 fn run_cmd(dir: &Path, argv: &[&str]) -> anyhow::Result<()> {
     let status = Command::new(argv[0])
         .args(&argv[1..])
@@ -37,7 +32,6 @@ fn run_cmd(dir: &Path, argv: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Like `run_cmd` but captures stdout and returns it as a trimmed String.
 fn run_cmd_output(dir: &Path, argv: &[&str]) -> anyhow::Result<String> {
     let out = Command::new(argv[0])
         .args(&argv[1..])
@@ -52,8 +46,6 @@ fn run_cmd_output(dir: &Path, argv: &[&str]) -> anyhow::Result<String> {
         .map_err(|_| anyhow::anyhow!("output of '{}' is not UTF-8", argv[0]))
 }
 
-/// Runs make, streams stdout to the terminal line-by-line, and returns the
-/// bzImage path extracted from the "Kernel: <path> is ready" line.
 fn run_make_capture_bzimage(dir: &Path, argv: &[&str]) -> anyhow::Result<PathBuf> {
     let mut child = Command::new(argv[0])
         .args(&argv[1..])
@@ -68,7 +60,6 @@ fn run_make_capture_bzimage(dir: &Path, argv: &[&str]) -> anyhow::Result<PathBuf
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|e| anyhow::anyhow!("read error during make: {e}"))?;
         println!("{line}");
-        // make emits e.g. "  Kernel: arch/x86/boot/bzImage is ready  (#3)"
         if let Some(rest) = line.trim().strip_prefix("Kernel: ") {
             if let Some(path_str) = rest.split(" is ready").next() {
                 bzimage = Some(dir.join(path_str.trim()));
@@ -86,8 +77,6 @@ fn run_make_capture_bzimage(dir: &Path, argv: &[&str]) -> anyhow::Result<PathBuf
 /// Queries the remote for all tags and returns the one that matches
 /// `v{upstream_version}` exactly, or the first tag that starts with that
 /// prefix (covers release-candidate suffixes).
-///
-/// Uses `git ls-remote --tags origin` so no local fetch is required.
 fn upstream_version_to_git_tag(kernel_src: &Path, upstream_version: &str) -> anyhow::Result<String> {
     let target = format!("v{upstream_version}");
 
@@ -106,7 +95,6 @@ fn upstream_version_to_git_tag(kernel_src: &Path, upstream_version: &str) -> any
 
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Output format: "<sha>\trefs/tags/<name>" — peeled refs end with "^{}".
     let mut prefix_match: Option<String> = None;
     for line in stdout.lines() {
         let refs_part = match line.split('\t').nth(1) {
@@ -128,63 +116,57 @@ fn upstream_version_to_git_tag(kernel_src: &Path, upstream_version: &str) -> any
     prefix_match.ok_or_else(|| anyhow::anyhow!("no remote tag found matching {target}"))
 }
 
-// Run with:
-//   TEST_KERNEL_SRC=/path/to/linux \
-//     cargo test -p kminimize vm_module_stats_integration -- --ignored --nocapture
-#[test]
-#[ignore = "requires VM infrastructure (QEMU, virtiofsd, proot) and a kernel build toolchain; set TEST_KERNEL_SRC and run with --ignored"]
-fn vm_module_stats_integration() {
-    let kernel_src_str = env::var("TEST_KERNEL_SRC").unwrap_or_else(|_| {
-        panic!(
-            "TEST_KERNEL_SRC is not set.\n\
-             Provide a Linux kernel source tree:\n  \
-             TEST_KERNEL_SRC=/path/to/linux \
-             cargo test -p kminimize vm_module_stats_integration -- --ignored --nocapture"
-        )
-    });
-    let kernel_src = PathBuf::from(&kernel_src_str);
-    assert!(
+pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
+    let kernel_src = args.linux_dir;
+    anyhow::ensure!(
         kernel_src.exists(),
-        "TEST_KERNEL_SRC path does not exist: {}",
+        "--linux-dir path does not exist: {}",
         kernel_src.display()
     );
 
-    // /tmp/kminimize-test-<pid>/kminimize-test-rootfs
     let test_dir = PathBuf::from(format!("/tmp/kminimize-test-{}", std::process::id()));
     let rootfs_path = test_dir.join("kminimize-test-rootfs");
 
-    fs::create_dir_all(&test_dir).expect("failed to create temp dir");
-    let keep = env::var_os("KMINIMIZE_KEEP_TESTDIR").is_some();
-    if keep {
-        println!("KMINIMIZE_KEEP_TESTDIR set — test directory will be kept at {}", test_dir.display());
+    fs::create_dir_all(&test_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create temp dir {}: {e}", test_dir.display()))?;
+    if args.keep_dir {
+        println!("--keep-dir set — test directory will be kept at {}", test_dir.display());
     }
-    let _cleanup = TempDir { path: test_dir, keep };
+    let _cleanup = TempDir { path: test_dir, keep: args.keep_dir };
+
+    let distro = args.distro.build();
 
     // Step 1: create VM rootfs; returns the kernel versions available after creation.
-    println!("Creating Debian rootfs at {}", rootfs_path.display());
-    let boot_kernels = qoc::create(&qoc::Debian, rootfs_path.clone()).expect("qoc::create failed");
-    assert_eq!(boot_kernels.len(), 1, "expected exactly one kernel after create, found: {boot_kernels:?}");
+    println!("Creating {} rootfs at {}", distro.name(), rootfs_path.display());
+    let boot_kernels = qoc::create(&*distro, rootfs_path.clone())
+        .map_err(|e| anyhow::anyhow!("qoc::create failed: {e}"))?;
+    anyhow::ensure!(
+        boot_kernels.len() == 1,
+        "expected exactly one kernel after create, found: {boot_kernels:?}"
+    );
     let boot_kernel_ver = boot_kernels.into_iter().next().unwrap();
     println!("boot kernel: {boot_kernel_ver}");
 
     // Step 2: boot the VM.
     println!("Starting VM...");
-    let (handle, _) =
-        qoc::start(rootfs_path.clone(), 1, false, &boot_kernel_ver).expect("qoc::start failed");
+    let (handle, _) = qoc::start(rootfs_path.clone(), 1, false, &boot_kernel_ver)
+        .map_err(|e| anyhow::anyhow!("qoc::start failed: {e}"))?;
 
     // Step 3: wait for the VM to become reachable and collect kernel info.
     println!("Waiting for VmInfo...");
-    let info = handle.wait_for_info().expect("wait_for_info failed");
+    let info = handle
+        .wait_for_info()
+        .map_err(|e| anyhow::anyhow!("wait_for_info failed: {e}"))?;
 
     let kernel_version = info
         .kernel_version
-        .expect("VmInfo::kernel_version is None");
+        .ok_or_else(|| anyhow::anyhow!("VmInfo::kernel_version is None"))?;
     let upstream_version = info
         .upstream_version
-        .expect("VmInfo::upstream_version is None");
+        .ok_or_else(|| anyhow::anyhow!("VmInfo::upstream_version is None"))?;
     let kernel_config_body = info
         .kernel_config
-        .expect("VmInfo::kernel_config is None — kernel must be built with CONFIG_IKCONFIG_PROC or have /boot/config-*");
+        .ok_or_else(|| anyhow::anyhow!("VmInfo::kernel_config is None — kernel must be built with CONFIG_IKCONFIG_PROC or have /boot/config-*"))?;
 
     println!("kernel_version:   {kernel_version}");
     println!("upstream_version: {upstream_version}");
@@ -195,14 +177,14 @@ fn vm_module_stats_integration() {
     for i in 0..10usize {
         let ssh_out = handle
             .ssh(&["cat", "/proc/modules"])
-            .unwrap_or_else(|e| panic!("ssh failed on iteration {i}: {e}"));
-        assert!(
+            .map_err(|e| anyhow::anyhow!("ssh failed on iteration {i}: {e}"))?;
+        anyhow::ensure!(
             ssh_out.success,
             "cat /proc/modules returned non-zero on iteration {i}"
         );
 
         let snapshot = gather::snapshot_from_content(&ssh_out.stdout)
-            .unwrap_or_else(|e| panic!("failed to parse /proc/modules on iteration {i}: {e}"));
+            .map_err(|e| anyhow::anyhow!("failed to parse /proc/modules on iteration {i}: {e}"))?;
 
         println!("snapshot {}: {} modules", i + 1, snapshot.modules.len());
         module_list.snapshots.push(snapshot);
@@ -212,40 +194,41 @@ fn vm_module_stats_integration() {
         }
     }
 
-    // Step 4b: collect device aliases and modules.alias — mirrors what kgather does locally.
-    // Pass as a single SSH argument so the remote login shell expands the glob itself
-    // (passing ["sh", "-c", "cmd"] is wrong: SSH joins args with spaces, making sh -c
-    // receive only the first word as its command string).
+    // Step 4b: collect device aliases and modules.alias.
     let alias_out = handle
         .ssh(&["cat /sys/bus/*/devices/*/modalias 2>/dev/null"])
-        .expect("failed to collect device aliases");
+        .map_err(|e| anyhow::anyhow!("failed to collect device aliases: {e}"))?;
     module_list.device_aliases = gather::parse_device_aliases(&alias_out.stdout);
     println!("device aliases: {}", module_list.device_aliases.len());
 
     let mod_alias_path = format!("/lib/modules/{}/modules.alias", kernel_version);
     let mod_alias_out = handle
         .ssh(&["cat", &mod_alias_path])
-        .expect("failed to collect modules.alias");
+        .map_err(|e| anyhow::anyhow!("failed to collect modules.alias: {e}"))?;
     module_list.modules_alias = gather::parse_modules_alias(&mod_alias_out.stdout);
     println!("modules.alias entries: {}", module_list.modules_alias.len());
 
-    if env::var_os("KMINIMIZE_KEEP_TESTDIR").is_some() {
+    if args.keep_dir {
         let gather_path = _cleanup.path.join("module_list.json");
-        module_list.save(&gather_path).expect("failed to save module_list");
+        module_list
+            .save(&gather_path)
+            .map_err(|e| anyhow::anyhow!("failed to save module_list: {e}"))?;
         println!("Gather data saved to {}", gather_path.display());
     }
 
     // Step 5: find the canonical upstream git tag.
     let git_tag = upstream_version_to_git_tag(&kernel_src, &upstream_version)
-        .expect("failed to find upstream git tag");
+        .map_err(|e| anyhow::anyhow!("failed to find upstream git tag: {e}"))?;
     println!("upstream git tag: {git_tag}");
 
     // Step 6: VM is no longer needed — terminate it before the build work.
     println!("Stopping VM...");
-    handle.stop().expect("VM stop failed");
+    handle
+        .stop()
+        .map_err(|e| anyhow::anyhow!("VM stop failed: {e}"))?;
 
-    // Record kernel list as the baseline before the build.
-    let kernels_before_build = qoc::list_kernels(&rootfs_path).expect("list_kernels failed");
+    let kernels_before_build = qoc::list_kernels(&rootfs_path)
+        .map_err(|e| anyhow::anyhow!("list_kernels failed: {e}"))?;
     println!("Kernels before build ({}):", kernels_before_build.len());
     for k in &kernels_before_build {
         println!("  {k}");
@@ -254,24 +237,22 @@ fn vm_module_stats_integration() {
     // Step 7: check out the exact upstream tag and clean the source tree.
     println!("Checking out {git_tag}...");
     run_cmd(&kernel_src, &["git", "checkout", &git_tag])
-        .expect("git checkout failed");
+        .map_err(|e| anyhow::anyhow!("git checkout failed: {e}"))?;
     run_cmd(&kernel_src, &["git", "clean", "-fddx"])
-        .expect("git clean failed");
+        .map_err(|e| anyhow::anyhow!("git clean failed: {e}"))?;
 
     // Step 8: place the VM's kernel config as .config.
     let dot_config = kernel_src.join(".config");
-    fs::write(&dot_config, &kernel_config_body).expect("failed to write .config");
+    fs::write(&dot_config, &kernel_config_body)
+        .map_err(|e| anyhow::anyhow!("failed to write .config: {e}"))?;
     println!(".config written ({} bytes)", kernel_config_body.len());
 
     // Step 9: normalise the config for the checked-out source version.
     println!("Running make olddefconfig (initial)...");
     run_cmd(&kernel_src, &["make", "olddefconfig"])
-        .expect("make olddefconfig (initial) failed");
+        .map_err(|e| anyhow::anyhow!("make olddefconfig (initial) failed: {e}"))?;
 
     // Step 9.5: apply known changes, each with a list of candidate commits.
-    // For each change the first successfully cherry-picked commit wins; the
-    // rest of the candidates for that change are skipped.  All changes are
-    // attempted regardless of whether any individual one succeeded.
     const PATCHES: &[(&str, &[&str])] = &[
         (
             "libbpf: Fix -Wdiscarded-qualifiers under C23",
@@ -296,14 +277,14 @@ fn vm_module_stats_integration() {
                 .args(["cherry-pick", hash])
                 .current_dir(&kernel_src)
                 .status()
-                .expect("failed to spawn git cherry-pick");
+                .map_err(|e| anyhow::anyhow!("failed to spawn git cherry-pick: {e}"))?;
             if status.success() {
                 println!("    Applied {hash}.");
                 applied = true;
                 break;
             }
             run_cmd(&kernel_src, &["git", "cherry-pick", "--abort"])
-                .expect("git cherry-pick --abort failed");
+                .map_err(|e| anyhow::anyhow!("git cherry-pick --abort failed: {e}"))?;
         }
         if !applied {
             println!("    No candidate commit could be applied.");
@@ -313,78 +294,86 @@ fn vm_module_stats_integration() {
     // Step 10: apply config reduction using the existing disable logic.
     println!("Reducing config...");
     kminimize::reduce_config(&kernel_src, &module_list, &dot_config)
-        .expect("reduce_config failed");
+        .map_err(|e| anyhow::anyhow!("reduce_config failed: {e}"))?;
 
     // Step 11: normalise again after reduction so cascades are resolved.
     println!("Running make olddefconfig (post-reduction)...");
     run_cmd(&kernel_src, &["make", "olddefconfig"])
-        .expect("make olddefconfig (post-reduction) failed");
+        .map_err(|e| anyhow::anyhow!("make olddefconfig (post-reduction) failed: {e}"))?;
 
     // Step 12: build the kernel; capture bzImage path from make output.
     println!("Building kernel (make -j24)...");
     let bzimage_path = run_make_capture_bzimage(&kernel_src, &["make", "-j24"])
-        .expect("kernel build failed");
+        .map_err(|e| anyhow::anyhow!("kernel build failed: {e}"))?;
     println!("bzImage: {}", bzimage_path.display());
 
-    // Step 13: get the kernel release string (appended to /lib/modules/<release>).
+    // Step 13: get the kernel release string.
     println!("Getting kernel release string...");
     let kernel_release = run_cmd_output(&kernel_src, &["make", "-s", "kernelrelease"])
-        .expect("make kernelrelease failed");
+        .map_err(|e| anyhow::anyhow!("make kernelrelease failed: {e}"))?;
     println!("kernel release: {kernel_release}");
 
     // Step 14: install bzImage and kernel config into rootfs /boot.
     let boot_dir = rootfs_path.join("boot");
-    fs::create_dir_all(&boot_dir).expect("failed to create rootfs /boot");
+    fs::create_dir_all(&boot_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create rootfs /boot: {e}"))?;
     let vmlinuz_dest = boot_dir.join(format!("vmlinuz-{kernel_release}"));
-    fs::copy(&bzimage_path, &vmlinuz_dest).expect("failed to copy bzImage to rootfs /boot");
+    fs::copy(&bzimage_path, &vmlinuz_dest)
+        .map_err(|e| anyhow::anyhow!("failed to copy bzImage to rootfs /boot: {e}"))?;
     println!("Installed {}", vmlinuz_dest.display());
     let config_dest = boot_dir.join(format!("config-{kernel_release}"));
-    fs::copy(&dot_config, &config_dest).expect("failed to copy .config to rootfs /boot");
+    fs::copy(&dot_config, &config_dest)
+        .map_err(|e| anyhow::anyhow!("failed to copy .config to rootfs /boot: {e}"))?;
     println!("Installed {}", config_dest.display());
 
     // Step 15: install kernel modules into rootfs.
     println!("Installing modules (make modules_install)...");
     let install_mod_path = format!("INSTALL_MOD_PATH={}", rootfs_path.display());
     run_cmd(&kernel_src, &["make", "modules_install", &install_mod_path])
-        .expect("make modules_install failed");
+        .map_err(|e| anyhow::anyhow!("make modules_install failed: {e}"))?;
     println!("Modules installed.");
 
     // Step 16: regenerate initrd for the new kernel in the rootfs.
     println!("Regenerating initrd...");
     let initrd_path = qoc::make_initrd(&rootfs_path, &kernel_release)
-        .expect("make_initrd failed");
+        .map_err(|e| anyhow::anyhow!("make_initrd failed: {e}"))?;
     println!("initrd: {}", initrd_path.display());
 
     // Step 17: list kernels and assert exactly one was added by the build.
     println!("Listing kernels in rootfs...");
-    let kernels = qoc::list_kernels(&rootfs_path).expect("list_kernels failed");
+    let kernels = qoc::list_kernels(&rootfs_path)
+        .map_err(|e| anyhow::anyhow!("list_kernels failed: {e}"))?;
     println!("Available kernels ({}):", kernels.len());
     for k in &kernels {
         println!("  {k}");
     }
-    assert_eq!(
-        kernels.len(),
-        kernels_before_build.len() + 1,
+    anyhow::ensure!(
+        kernels.len() == kernels_before_build.len() + 1,
         "expected exactly one new kernel; before: {kernels_before_build:?}, after: {kernels:?}"
     );
-    assert!(
+    anyhow::ensure!(
         kernels.iter().any(|k| k == &kernel_release),
         "newly built kernel '{kernel_release}' not found in list_kernels output"
     );
 
     // Step 18: boot the VM with the reduced kernel; stream QEMU output to console.
     println!("Booting reduced kernel {kernel_release} (show_log=true)...");
-    let (handle2, _) =
-        qoc::start(rootfs_path.clone(), 1, true, &kernel_release)
-            .expect("qoc::start (reduced kernel) failed");
-    let info2 = handle2.wait_for_info().expect("wait_for_info (reduced kernel) failed");
+    let (handle2, _) = qoc::start(rootfs_path.clone(), 1, true, &kernel_release)
+        .map_err(|e| anyhow::anyhow!("qoc::start (reduced kernel) failed: {e}"))?;
+    let info2 = handle2
+        .wait_for_info()
+        .map_err(|e| anyhow::anyhow!("wait_for_info (reduced kernel) failed: {e}"))?;
     println!(
         "Reduced kernel booted: version={:?} upstream={:?}",
         info2.kernel_version, info2.upstream_version
     );
-    handle2.stop().expect("VM stop (reduced kernel) failed");
+    handle2
+        .stop()
+        .map_err(|e| anyhow::anyhow!("VM stop (reduced kernel) failed: {e}"))?;
 
     println!("All steps completed successfully.");
-    assert_eq!(module_list.snapshots.len(), 10);
-    assert!(!git_tag.is_empty());
+    anyhow::ensure!(module_list.snapshots.len() == 10, "expected 10 snapshots, got {}", module_list.snapshots.len());
+    anyhow::ensure!(!git_tag.is_empty(), "git_tag is empty");
+
+    Ok(())
 }
