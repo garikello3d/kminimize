@@ -208,6 +208,13 @@ pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
     module_list.modules_alias = gather::parse_modules_alias(&mod_alias_out.stdout);
     println!("modules.alias entries: {}", module_list.modules_alias.len());
 
+    // Step 4c: detect system characteristics in the VM and derive pinned configs.
+    let initcpio_check = handle
+        .ssh(&["test", "-d", "/usr/lib/initcpio/install"])
+        .map_err(|e| anyhow::anyhow!("failed to check initcpio in VM: {e}"))?;
+    module_list.pinned_configs = gather::pinned_configs_for_system(initcpio_check.success);
+    println!("pinned configs: {}", module_list.pinned_configs.len());
+
     if args.keep_dir {
         let gather_path = _cleanup.path.join("module_list.json");
         module_list

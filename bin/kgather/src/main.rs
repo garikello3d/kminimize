@@ -41,13 +41,15 @@ fn gather_loop(output: PathBuf, interval_secs: u64) -> gather::Result<()> {
         ModuleList::new()
     };
 
-    // Collect device aliases and alias map fresh on every run.
+    // Collect device aliases, alias map, and pinned configs fresh on every run.
     list.device_aliases = collect_device_aliases();
     list.modules_alias = read_modules_alias();
+    list.pinned_configs = collect_forced_configs();
     eprintln!(
-        "kgather: {} device aliases, {} alias map entries",
+        "kgather: {} device aliases, {} alias map entries, {} pinned configs",
         list.device_aliases.len(),
         list.modules_alias.len(),
+        list.pinned_configs.len(),
     );
 
     eprintln!("kgather: writing to {}", output.display());
@@ -90,6 +92,12 @@ fn collect_device_aliases() -> Vec<String> {
         }
     }
     gather::parse_device_aliases(&raw)
+}
+
+/// Collect config symbols that must remain enabled on this system.
+fn collect_forced_configs() -> Vec<String> {
+    let has_initcpio = std::path::Path::new("/usr/lib/initcpio/install").is_dir();
+    gather::pinned_configs_for_system(has_initcpio)
 }
 
 /// Read `/lib/modules/<running-kernel>/modules.alias` and parse it into

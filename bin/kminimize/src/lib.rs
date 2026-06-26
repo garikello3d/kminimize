@@ -167,6 +167,20 @@ pub fn reduce_config(
     let mut to_disable = idle_to_disable;
     to_disable.extend(never_loaded_to_disable);
 
+    // Remove any symbol the gathered data explicitly pins to "stay enabled".
+    if !module_list.pinned_configs.is_empty() {
+        let pinned_full: HashSet<String> = module_list
+            .pinned_configs
+            .iter()
+            .map(|s| format!("CONFIG_{s}"))
+            .collect();
+        let pinned_count = to_disable.iter().filter(|s| pinned_full.contains(*s)).count();
+        if pinned_count > 0 {
+            println!("Retaining {pinned_count} symbol(s) marked as pinned by gathered data.");
+            to_disable.retain(|s| !pinned_full.contains(s));
+        }
+    }
+
     if to_disable.is_empty() {
         println!("Nothing left to disable after filtering selected symbols.");
         return Ok(());

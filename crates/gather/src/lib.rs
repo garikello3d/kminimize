@@ -72,6 +72,10 @@ pub struct ModuleList {
     pub device_aliases: Vec<String>,
     /// Module alias map from `/lib/modules/<ver>/modules.alias`: (pattern, module_name).
     pub modules_alias: Vec<(String, String)>,
+    /// Bare config symbol names (without `CONFIG_` prefix) that must remain enabled
+    /// regardless of observed usage.  Populated via [`parse_forced_configs`]; stub for now.
+    #[serde(default)]
+    pub pinned_configs: Vec<String>,
 }
 
 /// Per-module statistics aggregated across all observed snapshots.
@@ -111,6 +115,7 @@ impl ModuleList {
             snapshots: Vec::new(),
             device_aliases: Vec::new(),
             modules_alias: Vec::new(),
+            pinned_configs: Vec::new(),
         }
     }
 
@@ -562,6 +567,20 @@ pub fn parse_modules_alias(content: &str) -> Vec<(String, String)> {
             Some((pattern.trim().to_owned(), module.trim().to_owned()))
         })
         .collect()
+}
+
+/// Returns config symbols (bare, without `CONFIG_` prefix) that must remain enabled
+/// based on detected properties of the target system.
+///
+/// `has_initcpio_install`: whether `/usr/lib/initcpio/install` is present —
+/// indicates an mkinitcpio-based initramfs that requires LZ4 compression support.
+pub fn pinned_configs_for_system(has_initcpio_install: bool) -> Vec<String> {
+    let mut configs = Vec::new();
+    if has_initcpio_install {
+        configs.push("CRYPTO_LZ4".into());
+        configs.push("CRYPTO_LZ4HC".into());
+    }
+    configs
 }
 
 /// Reads the current loaded-module state from `/proc/modules` and returns
