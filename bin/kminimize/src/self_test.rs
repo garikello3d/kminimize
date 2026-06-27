@@ -1,9 +1,10 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+
+static KGATHER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kgather"));
 
 struct TempDir {
     path: PathBuf,
@@ -44,6 +45,28 @@ fn run_cmd_output(dir: &Path, argv: &[&str]) -> anyhow::Result<String> {
     String::from_utf8(out.stdout)
         .map(|s| s.trim().to_owned())
         .map_err(|_| anyhow::anyhow!("output of '{}' is not UTF-8", argv[0]))
+}
+
+fn scp_to_vm(port: u16, local_path: &Path, remote_path: &str) -> anyhow::Result<()> {
+    let port_str = port.to_string();
+    let dest = format!("root@localhost:{remote_path}");
+    let status = Command::new("scp")
+        .args([
+            "-P",
+            &port_str,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            local_path.to_str().unwrap(),
+            &dest,
+        ])
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn scp: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("scp to VM failed with {status}");
+    }
+    Ok(())
 }
 
 fn run_make_capture_bzimage(dir: &Path, argv: &[&str]) -> anyhow::Result<PathBuf> {
@@ -172,55 +195,48 @@ pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
     println!("upstream_version: {upstream_version}");
     println!("kernel_config:    {} bytes", kernel_config_body.len());
 
-    // Step 4: gather /proc/modules snapshots every second for 10 seconds.
-    let mut module_list = gather::ModuleList::new();
-    for i in 0..10usize {
-        let ssh_out = handle
-            .ssh(&["cat", "/proc/modules"])
-            .map_err(|e| anyhow::anyhow!("ssh failed on iteration {i}: {e}"))?;
-        anyhow::ensure!(
-            ssh_out.success,
-            "cat /proc/modules returned non-zero on iteration {i}"
-        );
+    // Step 4: deploy the embedded static kgather binary to the VM and run it.
+    let kgather_host_path = _cleanup.path.join("kgather");
+    fs::write(&kgather_host_path, KGATHER_BIN)
+        .map_err(|e| anyhow::anyhow!("failed to write kgather binary: {e}"))?;
+    fs::set_permissions(&kgather_host_path, fs::Permissions::from_mode(0o755))
+        .map_err(|e| anyhow::anyhow!("failed to chmod kgather: {e}"))?;
 
-        let snapshot = gather::snapshot_from_content(&ssh_out.stdout)
-            .map_err(|e| anyhow::anyhow!("failed to parse /proc/modules on iteration {i}: {e}"))?;
+    println!("Copying kgather to VM...");
+    scp_to_vm(handle.ssh_port, &kgather_host_path, "/tmp/kgather")
+        .map_err(|e| anyhow::anyhow!("failed to copy kgather to VM: {e}"))?;
 
-        println!("snapshot {}: {} modules", i + 1, snapshot.modules.len());
-        module_list.snapshots.push(snapshot);
+    println!("Running kgather on VM (15 seconds)...");
+    let gather_run = handle
+        .ssh(&["/tmp/kgather", "/tmp/modules.json", "1", "--duration", "15"])
+        .map_err(|e| anyhow::anyhow!("kgather SSH call failed: {e}"))?;
+    anyhow::ensure!(
+        gather_run.success,
+        "kgather exited with error:\n{}",
+        gather_run.stderr
+    );
+    println!("{}", gather_run.stderr.trim());
 
-        if i < 9 {
-            thread::sleep(Duration::from_secs(1));
-        }
-    }
+    let json_out = handle
+        .ssh(&["cat", "/tmp/modules.json"])
+        .map_err(|e| anyhow::anyhow!("failed to read modules.json from VM: {e}"))?;
+    anyhow::ensure!(json_out.success, "cat /tmp/modules.json failed");
 
-    // Step 4b: collect device aliases and modules.alias.
-    let alias_out = handle
-        .ssh(&["cat /sys/bus/*/devices/*/modalias 2>/dev/null"])
-        .map_err(|e| anyhow::anyhow!("failed to collect device aliases: {e}"))?;
-    module_list.device_aliases = gather::parse_device_aliases(&alias_out.stdout);
-    println!("device aliases: {}", module_list.device_aliases.len());
+    let modules_json_path = _cleanup.path.join("modules.json");
+    fs::write(&modules_json_path, json_out.stdout.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write modules.json locally: {e}"))?;
 
-    let mod_alias_path = format!("/lib/modules/{}/modules.alias", kernel_version);
-    let mod_alias_out = handle
-        .ssh(&["cat", &mod_alias_path])
-        .map_err(|e| anyhow::anyhow!("failed to collect modules.alias: {e}"))?;
-    module_list.modules_alias = gather::parse_modules_alias(&mod_alias_out.stdout);
-    println!("modules.alias entries: {}", module_list.modules_alias.len());
-
-    // Step 4c: detect system characteristics in the VM and derive pinned configs.
-    let initcpio_check = handle
-        .ssh(&["test", "-d", "/usr/lib/initcpio/install"])
-        .map_err(|e| anyhow::anyhow!("failed to check initcpio in VM: {e}"))?;
-    module_list.pinned_configs = gather::pinned_configs_for_system(initcpio_check.success);
-    println!("pinned configs: {}", module_list.pinned_configs.len());
-
+    let module_list = gather::ModuleList::load(&modules_json_path)
+        .map_err(|e| anyhow::anyhow!("failed to parse modules.json: {e}"))?;
+    println!(
+        "Gathered: {} snapshots, {} device aliases, {} alias entries, {} pinned configs",
+        module_list.snapshots.len(),
+        module_list.device_aliases.len(),
+        module_list.modules_alias.len(),
+        module_list.pinned_configs.len(),
+    );
     if args.keep_dir {
-        let gather_path = _cleanup.path.join("module_list.json");
-        module_list
-            .save(&gather_path)
-            .map_err(|e| anyhow::anyhow!("failed to save module_list: {e}"))?;
-        println!("Gather data saved to {}", gather_path.display());
+        println!("Gather data at {}", modules_json_path.display());
     }
 
     // Step 5: find the canonical upstream git tag.
@@ -379,7 +395,7 @@ pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("VM stop (reduced kernel) failed: {e}"))?;
 
     println!("All steps completed successfully.");
-    anyhow::ensure!(module_list.snapshots.len() == 10, "expected 10 snapshots, got {}", module_list.snapshots.len());
+    anyhow::ensure!(!module_list.snapshots.is_empty(), "kgather produced no snapshots");
     anyhow::ensure!(!git_tag.is_empty(), "git_tag is empty");
 
     Ok(())

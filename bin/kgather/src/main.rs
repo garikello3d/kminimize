@@ -1,18 +1,19 @@
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gather::ModuleList;
 
 const DEFAULT_INTERVAL_SECS: u64 = 10;
 
 fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {prog} <output_file> [interval_secs]");
+    eprintln!("Usage: {prog} <output_file> [interval_secs] [--duration <secs>]");
     eprintln!();
-    eprintln!("  output_file     Path to the JSON file where snapshots are accumulated.");
-    eprintln!("  interval_secs   Sampling interval (default: {DEFAULT_INTERVAL_SECS}).");
+    eprintln!("  output_file       Path to the JSON file where snapshots are accumulated.");
+    eprintln!("  interval_secs     Sampling interval (default: {DEFAULT_INTERVAL_SECS}).");
+    eprintln!("  --duration <secs> Stop after this many seconds (default: run forever).");
     eprintln!();
-    eprintln!("Runs until interrupted (SIGINT/SIGTERM). Appends one snapshot per interval.");
+    eprintln!("Runs until interrupted (SIGINT/SIGTERM) or --duration elapses.");
     std::process::exit(1);
 }
 
@@ -25,16 +26,22 @@ fn main() {
     let output = PathBuf::from(&args[1]);
     let interval_secs: u64 = args
         .get(2)
+        .filter(|s| !s.starts_with('-'))
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_INTERVAL_SECS);
 
-    if let Err(e) = gather_loop(output, interval_secs) {
+    let duration_secs: Option<u64> = args
+        .windows(2)
+        .find(|w| w[0] == "--duration")
+        .and_then(|w| w[1].parse().ok());
+
+    if let Err(e) = gather_loop(output, interval_secs, duration_secs) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn gather_loop(output: PathBuf, interval_secs: u64) -> gather::Result<()> {
+fn gather_loop(output: PathBuf, interval_secs: u64, duration_secs: Option<u64>) -> gather::Result<()> {
     let mut list = if output.exists() {
         ModuleList::load(&output)?
     } else {
@@ -53,9 +60,18 @@ fn gather_loop(output: PathBuf, interval_secs: u64) -> gather::Result<()> {
     );
 
     eprintln!("kgather: writing to {}", output.display());
-    eprintln!("kgather: sampling every {interval_secs}s, press Ctrl-C to stop");
+    if let Some(d) = duration_secs {
+        eprintln!("kgather: sampling every {interval_secs}s for {d}s then exiting");
+    } else {
+        eprintln!("kgather: sampling every {interval_secs}s, press Ctrl-C to stop");
+    }
+
+    let deadline = duration_secs.map(|d| Instant::now() + Duration::from_secs(d));
 
     loop {
+        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            break;
+        }
         let content = std::fs::read_to_string("/proc/modules")?;
         let snap = gather::snapshot_from_content(&content)?;
         eprintln!(
@@ -67,6 +83,7 @@ fn gather_loop(output: PathBuf, interval_secs: u64) -> gather::Result<()> {
         list.save(&output)?;
         thread::sleep(Duration::from_secs(interval_secs));
     }
+    Ok(())
 }
 
 /// Walk `/sys/bus/*/devices/*/modalias` and return the unique set of alias strings.
