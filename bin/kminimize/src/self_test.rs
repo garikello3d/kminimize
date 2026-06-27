@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::load_ltp;
+
 static KGATHER_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kgather"));
 
 struct TempDir {
@@ -139,6 +141,26 @@ fn upstream_version_to_git_tag(kernel_src: &Path, upstream_version: &str) -> any
     prefix_match.ok_or_else(|| anyhow::anyhow!("no remote tag found matching {target}"))
 }
 
+fn gather_collect_json(handle: &qoc::VmHandle, work_dir: &Path) -> anyhow::Result<gather::ModuleList> {
+    let json_out = handle
+        .ssh(&["cat", "/tmp/modules.json"])
+        .map_err(|e| anyhow::anyhow!("failed to read modules.json from VM: {e}"))?;
+    anyhow::ensure!(json_out.success, "cat /tmp/modules.json failed");
+
+    let path = work_dir.join("modules.json");
+    fs::write(&path, json_out.stdout.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write modules.json locally: {e}"))?;
+
+    gather::ModuleList::load(&path)
+        .map_err(|e| anyhow::anyhow!("failed to parse modules.json: {e}"))
+}
+
+fn run_load(handle: &qoc::VmHandle, load_type: crate::LoadType) -> anyhow::Result<()> {
+    match load_type {
+        crate::LoadType::Ltp => load_ltp::run(handle),
+    }
+}
+
 pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
     let kernel_src = args.linux_dir;
     anyhow::ensure!(
@@ -195,7 +217,7 @@ pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
     println!("upstream_version: {upstream_version}");
     println!("kernel_config:    {} bytes", kernel_config_body.len());
 
-    // Step 4: deploy the embedded static kgather binary to the VM and run it.
+    // Step 4: deploy the embedded static kgather binary to the VM.
     let kgather_host_path = _cleanup.path.join("kgather");
     fs::write(&kgather_host_path, KGATHER_BIN)
         .map_err(|e| anyhow::anyhow!("failed to write kgather binary: {e}"))?;
@@ -206,28 +228,51 @@ pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
     scp_to_vm(handle.ssh_port, &kgather_host_path, "/tmp/kgather")
         .map_err(|e| anyhow::anyhow!("failed to copy kgather to VM: {e}"))?;
 
-    println!("Running kgather on VM (15 seconds)...");
-    let gather_run = handle
-        .ssh(&["/tmp/kgather", "/tmp/modules.json", "1", "--duration", "15"])
-        .map_err(|e| anyhow::anyhow!("kgather SSH call failed: {e}"))?;
-    anyhow::ensure!(
-        gather_run.success,
-        "kgather exited with error:\n{}",
-        gather_run.stderr
-    );
-    println!("{}", gather_run.stderr.trim());
+    // Step 4b: run kgather — either finite (no load) or background + load + kill (with load).
+    let module_list = if let Some(load_type) = args.load_type {
+        // Start kgather in background on the VM (no --duration), capture its PID.
+        println!("Starting kgather on VM in background...");
+        let bg = handle
+            .ssh(&["nohup /tmp/kgather /tmp/modules.json 1 >/tmp/kgather.log 2>&1 & echo $!"])
+            .map_err(|e| anyhow::anyhow!("failed to start background kgather: {e}"))?;
+        anyhow::ensure!(bg.success, "background kgather launch failed");
+        let kgather_pid = bg.stdout.trim().to_owned();
+        anyhow::ensure!(!kgather_pid.is_empty(), "kgather PID was empty");
+        println!("kgather PID: {kgather_pid}");
 
-    let json_out = handle
-        .ssh(&["cat", "/tmp/modules.json"])
-        .map_err(|e| anyhow::anyhow!("failed to read modules.json from VM: {e}"))?;
-    anyhow::ensure!(json_out.success, "cat /tmp/modules.json failed");
+        // Run the load; it drives the observation window.
+        run_load(&handle, load_type)?;
 
-    let modules_json_path = _cleanup.path.join("modules.json");
-    fs::write(&modules_json_path, json_out.stdout.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to write modules.json locally: {e}"))?;
+        // Terminate kgather and give it a moment to finish the last JSON write.
+        handle
+            .ssh(&["kill", &kgather_pid])
+            .map_err(|e| anyhow::anyhow!("failed to kill kgather: {e}"))?;
+        handle
+            .ssh(&["sleep", "1"])
+            .map_err(|e| anyhow::anyhow!("post-kill sleep failed: {e}"))?;
 
-    let module_list = gather::ModuleList::load(&modules_json_path)
-        .map_err(|e| anyhow::anyhow!("failed to parse modules.json: {e}"))?;
+        // Print kgather's log for visibility.
+        if let Ok(log) = handle.ssh(&["cat", "/tmp/kgather.log"]) {
+            print!("{}", log.stdout.trim());
+        }
+
+        gather_collect_json(&handle, &_cleanup.path)?
+    } else {
+        // No load: run kgather synchronously for a fixed duration.
+        println!("Running kgather on VM (15 seconds)...");
+        let gather_run = handle
+            .ssh(&["/tmp/kgather", "/tmp/modules.json", "1", "--duration", "15"])
+            .map_err(|e| anyhow::anyhow!("kgather SSH call failed: {e}"))?;
+        anyhow::ensure!(
+            gather_run.success,
+            "kgather exited with error:\n{}",
+            gather_run.stderr
+        );
+        println!("{}", gather_run.stderr.trim());
+
+        gather_collect_json(&handle, &_cleanup.path)?
+    };
+
     println!(
         "Gathered: {} snapshots, {} device aliases, {} alias entries, {} pinned configs",
         module_list.snapshots.len(),
@@ -235,6 +280,7 @@ pub fn run(args: crate::SelfTestArgs) -> anyhow::Result<()> {
         module_list.modules_alias.len(),
         module_list.pinned_configs.len(),
     );
+    let modules_json_path = _cleanup.path.join("modules.json");
     if args.keep_dir {
         println!("Gather data at {}", modules_json_path.display());
     }

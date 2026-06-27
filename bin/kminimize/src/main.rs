@@ -1,3 +1,4 @@
+mod load_ltp;
 mod self_test;
 
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,12 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum LoadType {
+    /// Linux Test Project — exercises a broad set of kernel interfaces.
+    Ltp,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -42,6 +49,11 @@ pub(crate) struct SelfTestArgs {
     /// Keep the temporary work directory after the test completes (default: delete on exit).
     #[arg(long, default_value_t = false)]
     keep_dir: bool,
+
+    /// Workload to run in the VM during the gathering window.
+    /// kgather runs until the load finishes; without a load it runs for 15 s.
+    #[arg(long, value_enum)]
+    pub(crate) load_type: Option<LoadType>,
 }
 
 #[derive(Subcommand)]
